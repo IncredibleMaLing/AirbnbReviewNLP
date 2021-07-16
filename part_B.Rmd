@@ -1,0 +1,390 @@
+---
+title: "part_B"
+author: "Ling Ma"
+date: "23/05/2021"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+## Outline
+
+This part is related to how the sentiment in reviews would affect the prices and ratings, including two parts: polarity/affection analysis and syntactical feature analysis from structured variables and also unstructured variables.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(leaps)
+library(MASS)
+library(rvest)
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(tidytext)
+library(lubridate)
+library(lexicon)
+library(cld2)
+library(textstem)
+library(parallel)
+
+```
+
+
+## Affection categorization
+
+```{r load_dictionaries, include=FALSE}
+load("enviromentdata.RData")
+# Bing Liu
+bing_dictionary <- tidytext::get_sentiments("bing")
+
+# Afinn 
+afinn_dictionary <- tidytext::get_sentiments("afinn")
+
+# NRC dictionary (feelings)
+
+nrc_dictionary <- tidytext::get_sentiments("nrc")
+
+```
+
+## Sentiment Analysis
+
+```{r}
+library(tidyr)
+
+# On listing level:
+# Calculate average ratings for each property
+# Because one property has more than one rating
+all_listings <- all_data_df %>% ungroup() %>% 
+  dplyr::select(listing_id, description, price, review_scores_rating) %>%
+  unique(.)
+
+# Determine that one property only have one price
+listing_id_price <- all_listings %>% 
+  dplyr::select(listing_id,price) %>% 
+  mutate(price = as.numeric(gsub("\\$|,","",price))) 
+
+listing_id_rating <- all_listings %>%
+  group_by(listing_id) %>% 
+  dplyr::select(listing_id,review_scores_rating)
+
+comment_tokens_sentiment <- comment_tokens %>%
+  left_join(all_listings) %>%
+  dplyr::select(word,listing_id,review_scores_rating)
+
+# Calculate sentiment using Bing Liu sentiment lexicon
+# Sentiment for words is either positive or negative
+comment_tokens_sentiment %>% 
+  inner_join(bing_dictionary) %>%
+  ungroup() %>% 
+  count(listing_id, sentiment) %>% 
+  spread(sentiment,n) %>%
+  mutate_all(~replace(., is.na(.), 0)) %>% 
+  mutate(bing_liu_sentiment = positive - negative) %>%
+  dplyr::select(listing_id,bing_liu_sentiment) -> bing_liu_sentiment_listing
+
+bing_liu_sentiment_listing <- bing_liu_sentiment_listing %>%
+  left_join(listing_id_price)
+
+
+# Calculate sentiment using NRC emotion lexicon
+# NRC categorise words in binary fashion with eight basic emotions
+comment_tokens_sentiment %>% 
+  ungroup() %>% 
+  inner_join(nrc_dictionary) %>% 
+  count(listing_id, sentiment) %>%
+  spread(sentiment,n) %>% 
+  mutate_all(~replace(., is.na(.), 0)) -> emotions_nrc
+
+emotions_nrc <- emotions_nrc %>% 
+  left_join(listing_id_price) %>% 
+  mutate(sentiment_nrc = positive-negative)
+
+# Calculate sentiment using Afinn dictinary
+# Afinn rate words for valence with value between -5 to +5
+comment_tokens_sentiment %>% 
+  ungroup() %>% 
+  inner_join(afinn_dictionary) %>% 
+  group_by(listing_id) %>%
+  summarise(sentiment_affin = sum(value)) -> sentiment_affin
+
+sentiment_affin <- sentiment_affin %>% 
+  left_join(listing_id_price)
+
+
+# Combine each polarity together with listing_id and price
+all_together_sentiments <- bing_liu_sentiment_listing %>% 
+  left_join(emotions_nrc) %>%
+  left_join(sentiment_affin) %>%
+  left_join(listing_id_rating)%>%
+  na.omit()
+
+# Remove listings with price of zero
+all_together_sentiments <- all_together_sentiments %>%
+  filter(price > 0)
+
+# plot the sentiment score distribution with pricing /rating.
+
+## Regression Analysis
+
+# 1. Find the effect of sentiment on price
+# Consider sentiment as independent variable
+
+# Bing Liu sentiment
+model1 <- lm(log(price) ~ bing_liu_sentiment, 
+             data = all_together_sentiments)
+
+summary(model1)
+
+# NRC sentiment
+model2 <- lm(log(price) ~ sentiment_nrc,
+             data = all_together_sentiments)
+summary(model2)
+
+# Afinn sentiment
+model3 <- lm(log(price) ~ sentiment_affin,
+             data = all_together_sentiments)
+summary(model3)
+
+
+# Compare overall fit of different models using stargazer
+stargazer::stargazer(model1, model2, model3, type = "text")
+
+
+# 2. Find the effect of sentiment on rating
+# Consider sentiment as independent variable
+
+# Bing Liu sentiment
+model_1 <- lm(log(review_scores_rating) ~ bing_liu_sentiment, 
+              data = all_together_sentiments)
+summary(model_1)
+
+# NRC sentiment
+model_2 <- lm(log(review_scores_rating) ~ sentiment_nrc,
+              data = all_together_sentiments)
+summary(model_2)
+
+#Afinn sentiment
+model_3 <- lm(log(review_scores_rating) ~ sentiment_affin,
+              data = all_together_sentiments)
+summary(model_3)
+
+# Compare overall fit of different models using stargazer
+stargazer::stargazer(model1,model2,model3,type = "text")
+```
+
+
+## Calculation of exclamation marks and capital letters
+
+```{r}
+# Calculate the number of capital letter and exclamation marks
+library(stringr)
+# For capital letters, we want to match on two or more capital letters in succession that have boundarie instead of taking into irrelavant words like "I" or the first capital letter at the start of the sentenses into account.
+exclamation_capital_info <- reviews_df %>%
+  dplyr::select(listing_id, review_id, comments)
+
+exclamation_capital_info$listing_id <- as.character(exclamation_capital_info$listing_id)
+
+exclamation_capital_info <- exclamation_capital_info %>% 
+  mutate(
+    exclamation_count = str_count(exclamation_capital_info$comments, '!'),
+    capital_count = str_count(exclamation_capital_info$comments, '\\b[A-Z]{2,}\\b')) %>% 
+  group_by(listing_id) %>% 
+  summarise(total_exclamation = sum(exclamation_count),
+            total_capital = sum(capital_count)) %>%
+  na.omit()
+  
+
+# Join exclamation_capital_info with sentiment score together.
+all_together_sentiments <- all_together_sentiments %>% 
+  inner_join(exclamation_capital_info)
+```
+
+## Price regression
+
+```{r }
+sentiment_df <- all_together_sentiments %>% 
+  dplyr::select(listing_id, bing_liu_sentiment, total_exclamation, total_capital) 
+
+review_scores <- all_data_df %>% 
+  ungroup() %>% 
+  dplyr::select(listing_id, review_scores_rating, review_scores_accuracy, review_scores_cleanliness, review_scores_checkin, review_scores_communication) %>% 
+  unique(.)
+
+structured_df$listing_id <- as.character(structured_df$listing_id) 
+sentiment_df$listing_id <- as.character(sentiment_df$listing_id)
+listing_in_top_100$listing_id <- as.character(listing_in_top_100$listing_id)
+
+rfd_df <- readability_formality_diversity_table %>% 
+  dplyr::select(listing_id, syllable.count, word.count, formality, FK_grd.lvl, shannon, rating, price) 
+  
+regression_df <- structured_df %>% 
+  inner_join(sentiment_df) %>%
+  inner_join(rfd_df) %>%
+  inner_join(listing_in_top_100) %>% 
+  unique()
+
+str(regression_df)
+
+regression_df$price <- as.numeric(gsub("[\\$,]","",regression_df$price))
+
+price_regression <- regression_df %>% 
+  inner_join(review_scores) %>% 
+  relocate(c("review_scores_rating", "review_scores_accuracy", "review_scores_cleanliness", "review_scores_checkin", "review_scores_communication"), .before = rating) %>% 
+  dplyr::select(-c(rating,listing_id)) 
+
+price_baseline <- price_regression %>% 
+  dplyr::select(-c("bing_liu_sentiment", "total_exclamation", "total_capital", "syllable.count", "word.count", "formality", "FK_grd.lvl", "shannon"))
+
+# Standard deviation varies for different variables. Standardize the data.
+preproc <- preProcess(price_regression[,c(1,2,3,5,7,8,9,11,12,13,14,15,16,17,18)], method=c("range"))
+
+preproc_baseline <- preProcess(price_baseline[,c(1,2,3,5,7,8,9,10,11,13,14)], method=c("range"))
+ 
+price_regression[,c(1,2,3,5,7,8,9,11,12,13,14,15,16,17,18)] <- predict(preproc,price_regression[,c(1,2,3,5,7,8,9,11,12,13,14,15,16,17,18)])
+
+price_baseline [,c(1,2,3,5,7,8,9,10,11,13,14)]<- predict(preproc_baseline,price_baseline[,c(1,2,3,5,7,8,9,10,11,13,14)])
+
+# Relocate the target variable into the first column for further analysis.
+price_baseline <- price_baseline %>% 
+  relocate(price)
+price_regression <- price_regression %>% 
+  relocate(price)
+
+# Eliminate the space in the variable names.
+names(price_baseline)<-str_replace_all(names(price_baseline), c(" " = "." ))
+names(price_regression)<-str_replace_all(names(price_regression), c(" " = "." ))
+
+# Build up a multiple linear regression model using all the variables against rating. Due to the skewness of the target variable, use log() to resolve.
+res.price.baseline <- lm(log(price) ~., data = price_baseline)
+
+res.price.lm <- lm(log(price) ~., data = price_regression)
+
+step.price.baseline <- stepAIC(res.price.baseline, direction = "backward", trace = FALSE)
+step.price <- stepAIC(res.price.lm, direction = "backward", trace = FALSE)
+
+summary(step.price.baseline)
+summary(step.price)
+
+# Use univariate linear regression to pick out the significant variables and then build multiple linear regression model on the top of those variables.
+summary_i <- data.frame()
+univariate_price_summary <- data.frame()
+
+for(i in c(2:ncol(price_regression))){
+  this_col <- colnames(price_regression)[i]
+  lm_i <- lm(price ~ get(this_col), data = price_regression)
+  step_i <- stepAIC(lm_i, direction = "both", trace = TRUE)
+  summary_i <- cbind(this_col, t(as.numeric(coefficients(step_i)[1])), t(as.numeric(summary(step_i)$coefficients[1, 4])), summary(step_i)$r.squared, summary(step_i)$adj.r.squared)
+  univariate_price_summary <- rbind(univariate_price_summary, as.data.frame(summary_i))
+}
+
+univariate_price_summary <- univariate_price_summary %>% 
+  rename(coefficients = V2, p_value = V3, r_square = V4, adjusted_r_square = V5)
+
+univariate_price_summary$coefficients <- as.numeric(univariate_price_summary$coefficients) 
+univariate_price_summary$p_value <- as.numeric(univariate_price_summary$p_value) 
+univariate_price_summary$r_square <- as.numeric(univariate_price_summary$r_square) 
+univariate_price_summary$adjusted_r_square <- as.numeric(univariate_price_summary$adjusted_r_square) 
+
+price_sig <- univariate_price_summary %>%
+  filter(p_value <= 0.05 & r_square > 0) %>%
+  arrange(desc(r_square)) 
+
+
+price_sig_variables <- price_regression[(names(price_regression) %in% price_sig$this_col)] %>% cbind(price_regression$price) %>% 
+  rename(price = "price_regression$price") %>% 
+  relocate(price)
+
+res.lm.price.sig <- lm(log(price) ~., data = price_sig_variables)
+
+summary(res.lm.price.sig)
+
+step.price.sig <- stepAIC(res.lm.price.sig, direction = "both", trace = FALSE)
+summary(step.price.sig)
+
+# Compare overall fit of different models using stargazer
+stargazer::stargazer(step.price.baseline, step.price, step.price.sig, type = "text")
+```
+
+## Rating regression
+
+```{r}
+rating_regression <- regression_df  %>% 
+  inner_join(review_scores) %>% 
+  dplyr::select(-c(price, listing_id)) %>% 
+  relocate(c("review_scores_rating", "review_scores_accuracy", "review_scores_cleanliness", "review_scores_checkin", "review_scores_communication"), .before = rating)
+
+rating_baseline <- rating_regression %>% 
+  dplyr::select(-c("bing_liu_sentiment", "total_exclamation", "total_capital", "syllable.count", "word.count", "formality", "FK_grd.lvl", "shannon"))
+
+# Standard deviation varies for different variables. Standardize the data.
+preproc_rating <- preProcess(rating_regression[,c(1,2,3,5,7,8,9,11,12,13,14,15,16,17,18,19,20,21,22,23)], method=c("range"))
+ 
+rating_regression[,c(1,2,3,5,7,8,9,11,12,13,14,15,16,17,18,19,20,21,22,23)] <- predict(preproc,rating_regression[,c(1,2,3,5,7,8,9,11,12,13,14,15,16,17,18,19,20,21,22,23)])
+
+preproc_baseline <- preProcess(rating_baseline[,c(1,2,3,5,7,8,9,10,11,13,14)], method=c("range"))
+
+rating_baseline [,c(1,2,3,5,7,8,9,10,11,13,14)]<- predict(preproc_baseline,rating_baseline[,c(1,2,3,5,7,8,9,10,11,13,14)])
+# Relocate the target variable into the first column for further analysis.
+rating_regression <- rating_regression %>% 
+  relocate(rating)
+
+price_regression <- price_regression %>% 
+  relocate(price)
+
+# Eliminate the space in the variable names.
+names(rating_regression)<-str_replace_all(names(rating_regression), c(" " = "." ))
+names(rating_baseline)<-str_replace_all(names(rating_baseline), c(" " = "." ))
+
+
+# Build up a multiple linear regression model using all the variables against rating.
+res.rating.baseline <- lm(log(rating) ~., data = rating_baseline)
+res.lm.rating <- lm(log(rating) ~., data = rating_regression)
+
+step.rating.baseline <- stepAIC(res.rating.baseline, direction = "backward", trace = FALSE)
+step.rating <- stepAIC(res.lm.rating, direction = "backward", trace = FALSE)
+
+summary(step.rating)
+summary(step.rating.baseline)
+
+summary_i <- data.frame()
+univariate_rating_summary <- data.frame()
+
+for(i in c(2:ncol(rating_regression))){
+  this_col <- colnames(rating_regression)[i]
+  lm_i <- lm(rating ~ get(this_col), data = rating_regression)
+  step_i <- stepAIC(lm_i, direction = "backward", trace = TRUE)
+  summary_i <- cbind(this_col, t(as.numeric(coefficients(step_i)[1])), t(as.numeric(summary(step_i)$coefficients[1, 4])), summary(step_i)$r.squared, summary(step_i)$adj.r.squared)
+  univariate_rating_summary <- rbind(univariate_rating_summary, as.data.frame(summary_i))
+}
+
+univariate_rating_summary <- univariate_rating_summary %>% 
+  rename(coefficients = V2, p_value = V3, r_square = V4, adjusted_r_square = V5)
+
+univariate_rating_summary$coefficients <- as.numeric(univariate_rating_summary$coefficients) 
+univariate_rating_summary$p_value <- as.numeric(univariate_rating_summary$p_value) 
+univariate_rating_summary$r_square <- as.numeric(univariate_rating_summary$r_square) 
+univariate_rating_summary$adjusted_r_square <- as.numeric(univariate_rating_summary$adjusted_r_square) 
+
+rating_sig <- univariate_rating_summary %>%
+  filter(p_value <= 0.05 & r_square > 0) %>%
+  arrange(desc(r_square)) 
+
+
+rating_sig_variables <- rating_regression[(names(rating_regression) %in% rating_sig$this_col)] %>% cbind(rating_regression$rating) %>% 
+  rename(rating = "rating_regression$rating") %>% 
+  relocate(rating)
+
+res.lm.rating.sig <- lm(log(rating) ~., data = rating_sig_variables)
+
+step.rating.sig <- stepAIC(res.lm.rating.sig, direction = "backward", trace = FALSE)
+
+summary(step.rating.sig)
+
+# Compare overall fit of different models using stargazer
+stargazer::stargazer(step.rating.baseline, step.rating, step.rating.sig, type = "text")
+
+```

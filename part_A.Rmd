@@ -1,0 +1,898 @@
+---
+title: "part_A"
+author: "Ling Ma"
+date: "16/05/2021"
+output:
+  pdf_document:
+    toc: yes
+    number_sections: yes
+  html_document:
+    toc: yes
+    df_print: paged
+institute: Warwick Business School - University of Warwick
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rvest)
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(tidytext)
+library(lubridate)
+library(lexicon)
+library(cld2)
+library(textstem)
+library(parallel)
+
+```
+
+## Fetch the data
+
+```{r gettingdata, message=FALSE}
+
+# Input url to an object and read it into html_list
+data_airbnb_url <- "http://insideairbnb.com/get-the-data.html"
+html_list <- read_html(data_airbnb_url)
+
+# Scrape table contents and get data of Bristol into an object 
+city_table <- html_list %>% 
+  html_nodes("table")
+
+# Get the table of the 18th city in the table, Bristol
+my_data <- city_table[[18]]%>%
+    html_table()
+
+#Get the file links for London and add into london_table
+my_links <- city_table[[18]] %>% 
+    html_nodes("a") %>% html_attr("href")
+
+my_data$link <- my_links
+  
+# Tidy up column names to snake_case
+colnames(my_data) <- gsub(" ","_",tolower(colnames(my_data)))
+colnames(my_data) <- gsub("/","_",colnames(my_data))
+  
+# Format file upload date in formatted version
+my_data$date_compiled <- as.Date(my_data$date_compiled,format = "%d %b,%Y")
+ 
+ 
+# We want to scrape all the latest Review file and combine them together, using unique to remove repetition.
+review_metadata <- my_data %>% 
+    arrange(desc(date_compiled)) %>% 
+    filter(grepl("Detailed Review",description)) 
+  
+# Same with the listing file
+listing_metadata <- my_data %>% 
+    arrange(desc(date_compiled)) %>% 
+    filter(grepl("Detailed Listings",description)) 
+  
+#  Get all Calendar files available
+calendar_data <- my_data %>% 
+    arrange(desc(date_compiled)) %>% 
+    filter(grepl("Detailed Calendar",description))
+
+# Get only the latest neighborhood file
+
+# Get the city name
+my_city <- tolower(listing_metadata$country_city[1])
+  
+# Create city folders for review and listing files
+dir.create(my_city) 
+dir.create(paste0(my_city,"/review")) 
+dir.create(paste0(my_city,"/listing")) 
+
+# Download csv.gz files for listing and review.
+for (number_of_review_files in 1:nrow(review_metadata)) {
+     download.file(
+       url = review_metadata$link[number_of_review_files],
+       destfile = paste0( my_city,"/review/", review_metadata$date_compiled[number_of_review_files],".", "reviews.csv.gz"))
+   }
+
+
+for (number_of_listing_files in 1:nrow(listing_metadata)) {
+     download.file(
+       url = listing_metadata$link[number_of_listing_files],
+       destfile = paste0( my_city,"/listing/", listing_metadata$date_compiled[number_of_listing_files],".", "listings.csv.gz"))
+}
+
+```
+
+## Data loading
+
+```{r load the data}
+# Read downloaded Listing and Review files in R and combine different date of them together, using unique to remove repetition.
+reviews_df <- data.frame()
+for (number_of_review_files in 1:nrow(review_metadata)) {
+     this_df <- readr::read_csv( paste0(my_city,"/review/", review_metadata$date_compiled[number_of_review_files],".", "reviews.csv.gz"))
+     reviews_df <- bind_rows(reviews_df, this_df) %>% unique()
+   }
+
+listings_df <- data.frame()
+for (number_of_listing_files in 1:nrow(listing_metadata)) {
+     this_df <- readr::read_csv( paste0(my_city,"/listing/", listing_metadata$date_compiled[number_of_listing_files],".", "listings.csv.gz"))
+     listings_df <- bind_rows(listings_df, this_df) %>% unique()
+}
+
+# Check out the structure and summary of the data
+glimpse(listings_df)
+glimpse(reviews_df)
+```
+
+## Data joining
+
+```{r}
+# Rename id columns for joining purpose
+listings_df <- listings_df %>% 
+  rename(listing_id = id)
+reviews_df <- reviews_df %>% 
+  rename(review_id = id)
+
+# Join Listing and Review data frame using listing ID.
+
+# Right/Left/Inner join can all be used since after we deal with NA review comment in the data cleanning stage, the result will all be the same.Here we use left join.
+
+# Eliminate repetition and keep only observations with unique listing_id, review_id and comments.
+all_data_df <- listings_df %>% 
+  left_join(reviews_df) %>% group_by(listing_id, review_id) %>%  slice(1)
+
+# Have a look at our complete data.
+glimpse(all_data_df)
+
+
+```
+
+## Data cleaning and text pre-processing
+
+### Unstructured variables cleaning
+
+```{r review cleaning}
+all_data_df$listing_id <- as.character(all_data_df$listing_id)
+
+# Keep only reviews before Covid for analysis and eliminate NA comments.
+all_data_df<- all_data_df %>% filter(date < "2020-02-01") %>% 
+  filter(!(is.na(comments)))
+
+# Cleaning up the language. For some computers the character set is not automatically set to latin or ASCII, using iconv() to standardise.
+all_data_df$comments <- iconv(all_data_df$comments)
+  
+ 
+# Filter out non-English reviews, recuded approximately 12% of review.
+all_data_df <- all_data_df %>% 
+  mutate(review_language = cld2::detect_language(comments,plain_text = TRUE))%>%
+  filter(review_language == "en")
+
+# Limit the review by removing too short and too long characters
+all_data_df$review_length_chars <- nchar(all_data_df$comments)
+
+# Data from comments column is transformed from raw into understandable format to be useful for further analysis.
+
+# Check min, max, mean and quantile statistics to decide the limitation
+max(all_data_df$review_length_chars)
+min(all_data_df$review_length_chars)
+mean(all_data_df$review_length_chars)
+
+quantile_review <- quantile(all_data_df$review_length_chars)
+lower_limit <- quantile(all_data_df$review_length_chars, probs = 0.05)
+
+all_data_df <- all_data_df%>%
+  arrange(desc(review_length_chars))
+
+all_data_df <- all_data_df %>%
+  filter(between(review_length_chars,lower_limit,1000))
+
+# Review the spread using histogram
+hist(all_data_df$review_length_chars,breaks = 800)
+
+# Remove digits and punctuations in comments
+all_data_df$comments <- gsub('[[:digit:]]+',' ', all_data_df$comments)
+all_data_df$comments <- gsub('[[:punct:]]+',' ', all_data_df$comments)
+
+```
+
+#### Breakdown Amenities
+
+```{r breakdown amenities}
+amenity <- all_data_df %>% 
+  ungroup() %>% 
+  dplyr::select(listing_id, amenities) %>% 
+  na.omit()
+amenity$amenities <- gsub('"',"", amenity$amenities)
+
+amenity <- amenity %>% 
+  mutate(amenities = strsplit(as.character(amenities), ",")) %>%
+  unnest(amenities)
+
+amenity$amenities <- gsub('\\[|\\]|\\{|\\}',"", amenity$amenities) %>%
+  tolower() 
+
+amenity$amenities <- gsub("^\\s*","", amenity$amenities)
+
+# Pick top 100 most frequently mentioned amenites for further regression use.
+
+top_100 <- amenity %>%
+  group_by(amenities) %>%
+  summarise(num = n()) %>%
+  arrange(desc(num)) %>%
+  head(100) 
+
+listing_in_top_100 <- amenity %>%
+  left_join(top_100) %>%
+  na.omit() %>% 
+  dplyr::select(-c(num)) %>% 
+  pivot_wider(names_from = "amenities", 
+            values_from = 'amenities', 
+            values_fill = 0,
+            values_fn = function(x) 1)
+
+listing_in_top_100 <- amenity %>%
+  left_join(top_100) %>%
+  na.omit() %>% 
+  dplyr::select(-c(num)) %>% 
+  pivot_wider(names_from = "amenities", 
+            values_from = 'amenities', 
+            values_fill = 0,
+            values_fn = function(x) 1)
+```
+
+### Structured variables cleaning
+
+```{r Structured variables cleaning}
+# Choose potential relavant structured variables.
+structured_df <- all_data_df %>% 
+  ungroup() %>% 
+  dplyr::select(listing_id, host_response_time, host_response_rate, host_acceptance_rate, host_is_superhost, host_total_listings_count, host_has_profile_pic, accommodates, bathrooms,  beds, instant_bookable) 
+
+# handle NA values
+structured_df$host_response_time <- 
+  gsub("N/A", NA,structured_df$host_response_time)
+structured_df$host_response_rate <- 
+  gsub("N/A", NA,structured_df$host_response_rate)
+structured_df$host_acceptance_rate <- 
+  gsub("N/A", NA,structured_df$host_acceptance_rate)
+structured_df <- structured_df %>% na.omit()
+
+str(structured_df)
+
+#We have 13239 listing properties with complete structured features' information. We will carry on regression analysis based on them.
+
+ 
+# Now we conduct encoding method for further uses. 
+# In the variable of host_response time, we have four levels of: a few days or more-3, within a day-2, within a few hours-1, within an hour-0.
+
+structured_df$host_response_time <-  
+  case_when(structured_df$host_response_time == "a few days or more"~ 3,
+            structured_df$host_response_time == "within a day" ~ 2,
+            structured_df$host_response_time == "within a few hours" ~ 1,
+            TRUE ~ 0 )
+  
+  
+# For host_response_rate and host_acceptance_rate we need to change it from character to numeric and get rid of percentage mark. 
+structured_df$host_response_rate <- as.numeric(gsub("[\\%,]", "", structured_df$host_response_rate))
+structured_df$host_acceptance_rate <- as.numeric(gsub("[\\%,]", "", structured_df$host_acceptance_rate))
+
+# For host_is_superhost, host_has_profile_pic, instant_bookable these three logical variables use 0-FALSE, 1-TRUE.
+
+structured_df$host_is_superhost <- ifelse(structured_df$host_is_superhost == TRUE, 1,0)
+structured_df$host_has_profile_pic <- ifelse(structured_df$host_has_profile_pic == TRUE, 1,0)
+structured_df$instant_bookable <- ifelse(structured_df$instant_bookable == TRUE, 1,0)
+
+str(structured_df)
+```
+
+## Customize stop words
+
+```{r cus_stopwords}
+# Load the SMART stopword list in Tidytext pkg.
+data("stop_words")
+#Fry's 100 Most Commonly Used English Words - not useful for analysis.
+data("sw_fry_100")
+
+# Remove stop words using dictionaries and customised stop words.
+
+# Property type names are added to stop words.
+property_name <- all_data_df$property_type %>% 
+  tolower() %>% 
+  strsplit(" ") %>% 
+  unlist() %>% 
+  unique()
+  
+
+# Room type names are added to stop words.
+room_name <- all_data_df$room_type %>% 
+  tolower() %>% 
+  unique()
+
+
+# Neighbourhood and neighbourhood cleansed names are added to stop words.
+neighbourhood_name <- all_data_df$neighbourhood %>% 
+  tolower() %>%
+  unique() %>% 
+  strsplit(" ") %>% 
+  unlist() 
+
+# Get rid of the comma at the end of some term
+neighbourhood_name <- gsub(pattern = "\\,", "", neighbourhood_name)
+
+neighbourhood_cleansed_name <- all_data_df$neighbourhood_cleansed %>% 
+  tolower() %>% 
+  unique() %>% 
+  strsplit(" ") %>% 
+  unlist()
+
+
+# Host names are added to stop words.
+host_name <- all_data_df$host_name %>% 
+  tolower() %>% 
+  unique()
+
+# All stop words are combined into one object cus_stopwords.
+cus_stopwords <- c("airbnb", "min", "minute", property_name, room_name, neighbourhood_name, neighbourhood_cleansed_name,  host_name, my_city) %>% unique()
+```
+
+## Data tokenization
+
+### Comments tokenization
+
+```{r tokenization}
+comment_tokens <- data.frame()
+
+comment_tokens <- all_data_df %>% unnest_tokens(word, comments) %>% 
+  anti_join(stop_words) %>% 
+  filter(!(word %in% c(sw_fry_100, cus_stopwords))) %>% 
+  group_by(listing_id) %>%
+  count(word, sort = TRUE) %>% 
+  ungroup() 
+
+# Data Lemmatization
+comment_tokens$word <- lemmatize_words(comment_tokens$word) 
+
+comment_tokens <- comment_tokens %>% group_by(listing_id, word) %>% mutate(total = sum(n)) %>% slice(1)
+
+# Calculate token length
+# Remove too short and too long tokens
+comment_tokens$token_length <- nchar(comment_tokens$word)
+
+# Using boxplot and histogram to get rid of potential outlier length. 
+hist(comment_tokens$token_length,breaks = 800)
+boxplot(comment_tokens$token_length)
+comment_tokens <- comment_tokens %>% 
+  filter(between(token_length,3,15)) 
+# Clean tokens by stop words removal 
+comment_tokens <- comment_tokens %>%
+  filter(!(word %in% cus_stopwords))
+
+comment_tokens_tf_idf <- comment_tokens %>% 
+  bind_tf_idf(word, listing_id, total)
+
+
+# How to find TF-IDF cut-off value? using mean+- 3 sd.
+# Filter important words using left and right trim
+avg_comment_tf_idf <- mean(comment_tokens_tf_idf$tf_idf)
+sd_comment_tf_idf <- sd(comment_tokens_tf_idf$tf_idf)
+hist(comment_tokens_tf_idf$tf_idf,breaks = 500)
+
+comment_tokens_tf_idf  <- comment_tokens_tf_idf  %>% 
+  filter(between(tf_idf,
+                 avg_comment_tf_idf - 3*sd_comment_tf_idf,
+                 avg_comment_tf_idf + 3*sd_comment_tf_idf)) %>%
+  arrange(desc(tf_idf))
+
+remove_list <- comment_tokens_tf_idf %>% filter(tf_idf < avg_comment_tf_idf - 3*sd_comment_tf_idf) %>% bind_rows(filter(comment_tokens_tf_idf, tf_idf > avg_comment_tf_idf + 3*sd_comment_tf_idf))
+        
+comment_tokens_tf_idf %>%  group_by(word) %>% slice(1) %>% arrange(idf) %>% head(20)
+
+cus_stopwords <- c(cus_stopwords, "stay", "space", "live", "flat")
+comment_tokens <- comment_tokens %>% 
+  filter(!(word %in% cus_stopwords))
+comment_tokens_tf_idf <- comment_tokens_tf_idf %>% 
+  filter(!(word %in% cus_stopwords))
+
+# Cast tokens to a DTM (document-term matrix)
+library(tm)
+reviews_dtm <- comment_tokens%>% 
+  cast_dtm(listing_id,word,n)
+
+# Find 10 most important words
+comment_tokens %>% 
+  group_by(word) %>% 
+  summarise(total =n()) %>% 
+  arrange(desc(total)) %>% top_n(10)
+```
+
+### Property description cleaning tokenization
+
+```{r}
+# Data about property description is transformedfrom raw into understandable format to be useful for further analysis. Same process with comments.
+# Columns listed above combined into one column and tokenise 
+# Assume that description of property is the combination of summary, space, neighborhood_overview and notes column
+all_description <- all_data_df %>% ungroup() %>% 
+  dplyr::select(listing_id, summary, space, description, neighborhood_overview,notes) %>%
+  unite("full_description",c("summary","space","description","neighborhood_overview","notes")) %>% 
+  unnest_tokens(sentence,full_description,token = "sentences")%>%
+  unique(.)
+
+# Remove digits and punctuations in sentences
+all_description$sentence <- gsub("n't"," not",all_description$sentence)
+all_description$sentence <- gsub('[[:digit:]]+',' ', all_description$sentence)
+all_description$sentence <- gsub('[[:punct:]]+',' ', all_description$sentence)
+
+# Filter non-English reviews
+all_description<- all_description %>% 
+  mutate(review_language = cld2::detect_language(sentence,plain_text = TRUE)) %>%
+  filter(review_language == "en")
+
+description_tokens <- data.frame()
+
+description_tokens <- all_description %>% 
+  dplyr::select(-c("review_language")) %>% 
+  unnest_tokens(word,sentence) %>% 
+  anti_join(stop_words) %>% 
+  filter(!(word %in% c(sw_fry_100, cus_stopwords, "br"))) %>%  
+  group_by(listing_id) %>% count(word, sort = TRUE) 
+
+# Data Lemmatization
+description_tokens$word <- lemmatize_words(description_tokens$word) 
+
+description_tokens <- description_tokens %>% group_by(listing_id, word) %>% mutate(total = sum(n)) %>% slice(1)
+
+# Calculate token length
+# Remove too short and too long tokens
+description_tokens$token_length <- nchar(description_tokens$word)
+
+# Using boxplot and histogram to get rid of potential outlier length. 
+hist(description_tokens$token_length,breaks = 800)
+boxplot(description_tokens$token_length)
+description_tokens <- description_tokens %>% 
+  filter(between(token_length,3,11)) 
+# Clean tokens by stop words removal 
+description_tokens <- description_tokens %>%
+  filter(!(word %in% cus_stopwords))
+
+description_tokens_tf_idf <- description_tokens %>% 
+  bind_tf_idf(word, listing_id, total)
+
+
+# How to find TF-IDF cut-off value? using mean+- 3 sd.
+# Filter important words using left and right trim
+avg_description_tf_idf <- mean(description_tokens_tf_idf$tf_idf)
+sd_description_tf_idf <- sd(description_tokens_tf_idf$tf_idf)
+hist(description_tokens_tf_idf$tf_idf,breaks = 500)
+
+description_tokens_tf_idf  <- description_tokens_tf_idf  %>% 
+  filter(between(tf_idf,
+                 avg_comment_tf_idf - 3*sd_comment_tf_idf,
+                 avg_comment_tf_idf + 3*sd_comment_tf_idf)) %>%
+  arrange(desc(tf_idf))
+
+ 
+description_tokens_tf_idf %>%  group_by(word) %>% slice(1) %>% arrange(idf) %>% head(20)
+
+description_tokens_tf_idf <- description_tokens_tf_idf %>%
+  filter(!(word %in% cus_stopwords))
+
+# Cast tokens to a DTM (document-term matrix)
+description_dtm <- description_tokens %>% 
+  cast_dtm(listing_id,word,n)
+
+# Find 10 most important words
+description_tokens %>% 
+  group_by(word) %>% 
+  summarise(total =n()) %>% 
+  arrange(desc(total)) %>% top_n(10)
+```
+
+### Transport Information tokenization
+
+```{r}
+# Data from transit column is transformed 
+# from raw into understandable format
+# to be useful for further analysis
+
+transport <- all_data_df %>%
+  ungroup() %>% 
+  dplyr::select(listing_id,transit) %>%
+  filter(!(is.na(transit)))
+
+# Remove digits and punctuations in transit column
+transport$transit <- gsub('[[:digit:]]+',' ', transport$transit)
+transport$transit <- gsub('[[:punct:]]+',' ', transport$transit)
+
+# Filter non-English reviews
+transport <- transport %>%
+  mutate(review_language = cld2::detect_language(transit,plain_text = TRUE))%>%
+  filter(review_language == "en")
+
+transport_tokens <- data.frame()
+
+transport_tokens <- transport %>% 
+  dplyr::select(-c("review_language")) %>% 
+  unnest_tokens(word, transit) %>% 
+  anti_join(stop_words) %>% 
+  filter(!(word %in% c(sw_fry_100, cus_stopwords))) %>%  
+  group_by(listing_id) %>% count(word, sort = TRUE) 
+
+transport_tokens$word <- tolower(transport_tokens$word)
+
+# Data Lemmatization
+transport_tokens$word <- lemmatize_words(transport_tokens$word) 
+
+transport_tokens <- transport_tokens %>% group_by(listing_id, word) %>% mutate(total = sum(n)) %>% slice(1)
+
+# Calculate token length
+# Remove too short and too long tokens
+transport_tokens$token_length <- nchar(transport_tokens$word)
+
+# Using boxplot and histogram to get rid of potential outlier length. 
+hist(transport_tokens$token_length,breaks = 800)
+boxplot(transport_tokens$token_length)
+transport_tokens <- transport_tokens %>% 
+  filter(between(token_length,3,11)) 
+# Clean tokens by stop words removal 
+transport_tokens <- transport_tokens %>%
+  filter(!(word %in% cus_stopwords))
+
+# Calculate TF-IDF
+# Word as term, listing as document
+transport_tokens_tf_idf <- transport_tokens %>% 
+  bind_tf_idf(word, listing_id, total)
+
+# Find TF-IDF cut-off value
+# Filter important words using left and right trim
+avg_transport_tf_idf <- mean(transport_tokens_tf_idf$tf_idf)
+sd_transport_tf_idf <- sd(transport_tokens_tf_idf$tf_idf)
+transport_tokens_tf_idf <- transport_tokens_tf_idf %>% 
+  filter(between(tf_idf,avg_transport_tf_idf - 3*sd_transport_tf_idf,
+                 avg_transport_tf_idf + 3*sd_transport_tf_idf))%>%
+  arrange(desc(tf_idf))
+hist(transport_tokens_tf_idf$tf_idf,breaks = 800)
+
+transport_tokens_tf_idf <- transport_tokens_tf_idf %>%
+  filter(!(word %in% cus_stopwords))
+
+# Cast tokens to a DTM (document-term matrix)
+transport_dtm <- transport_tokens %>% 
+  cast_dtm(listing_id,word,n)
+
+# Find 10 most important words
+transport_tokens %>% 
+  group_by(word) %>% 
+  summarise(total =n()) %>% 
+  arrange(desc(total)) %>% top_n(10)
+```
+
+## Question a
+
+```{r Qa}
+# The processed textual data of airbnb can now be use for getting insights
+# For example,find dominant words per aggregation category
+# In this case, the aggregation category is neighborhood in Bristol.
+
+# 1. Get the top 10 tokens per neighborhood (top 5) for the review
+# Get the top 5 neighborhood name 
+top_5_neighborhood <- all_data_df %>%  
+  ungroup() %>% 
+  dplyr::select(listing_id,neighbourhood_cleansed) %>%
+  unique(.) %>% 
+  group_by(neighbourhood_cleansed) %>% 
+  summarise(total =n()) %>% 
+  arrange(desc(total)) %>% 
+  top_n(5)
+
+# Get listing_id and tokens in comments for these neighborhoods
+top_5_neighborhood_listing <- all_data_df %>% ungroup() %>% 
+  dplyr::select(listing_id,neighbourhood_cleansed) %>% 
+  filter(neighbourhood_cleansed %in% top_5_neighborhood$neighbourhood_cleansed) %>% 
+  unique(.)
+
+neighbourhood_tokens_comments <- comment_tokens_tf_idf %>% 
+  right_join(top_5_neighborhood_listing) %>%  
+  group_by(neighbourhood_cleansed,word) %>% 
+  summarise(total=sum(n)) %>% 
+  arrange(desc(total)) 
+
+# Get the top 10 tokens per neighborhood for review
+for( i in 1:nrow(top_5_neighborhood)){
+  print(paste0("For neighbourhood: ",top_5_neighborhood$neighbourhood_cleansed[i]))
+  word <- neighbourhood_tokens_comments %>% ungroup() %>% 
+    filter(neighbourhood_cleansed == top_5_neighborhood$neighbourhood_cleansed[i]) %>% 
+    top_n(10,total) %>% 
+    dplyr::select(-total) %>% 
+    mutate(rank = row_number())
+  
+  print(word)
+}
+
+general_dominant_word <- c("flat","lovely","location","clean","comfortable","recommend", "nice","friendly","perfect", "home", "easy", "walk")
+
+specialised_neighbourhood_tokens_comments <- neighbourhood_tokens_comments %>% filter(!(word %in% general_dominant_word))
+
+specialised_neighbourhood_tokens_comments %>% 
+group_by(neighbourhood_cleansed,word) %>% 
+  arrange(desc(total)) %>% head(20)
+
+for( i in 1:nrow(top_5_neighborhood)){
+  print(paste0("For neighbourhood: ",top_5_neighborhood$neighbourhood_cleansed[i]))
+  word <- specialised_neighbourhood_tokens_comments %>% ungroup() %>% 
+    filter(neighbourhood_cleansed == top_5_neighborhood$neighbourhood_cleansed[i]) %>% 
+    top_n(10,total) %>% 
+    dplyr::select(-total) %>% 
+    mutate(rank = row_number())
+  
+  print(word)
+}
+
+# 2. Get the top 10 tokens per neighborhood (top 5) for description
+# Get tokens in description for these neighborhoods
+neighbourhood_tokens_description <- description_tokens_tf_idf %>% 
+  right_join(top_5_neighborhood_listing) %>%  
+  group_by(neighbourhood_cleansed,word) %>% 
+  summarise(total=sum(n)) %>% 
+  arrange(desc(total)) 
+
+# Get the top 10 tokens per neighborhood for description
+for(neighb in 1:nrow(top_5_neighborhood)){
+  print(paste0("For neighbourhood: ",top_5_neighborhood$neighbourhood_cleansed[neighb]))
+  toprint <- neighbourhood_tokens_description %>% ungroup() %>% 
+    filter(neighbourhood_cleansed == top_5_neighborhood$neighbourhood_cleansed[neighb]) %>% 
+    top_n(10,total) %>% 
+    dplyr::select(-total) %>% 
+    mutate(rank = row_number())
+  
+  print(toprint)
+}
+
+# 3. Get the top 10 tokens per neighborhood (top 5) for transport
+# Get tokens in transit for these neighborhoods
+neighbourhood_tokens_transport <- transport_tokens_tf_idf %>% 
+  right_join(top_5_neighborhood_listing) %>%  
+  group_by(neighbourhood_cleansed,word) %>% 
+  summarise(total=sum(n)) %>% 
+  arrange(desc(total)) 
+
+# Get the top 10 tokens per neighborhood for transport
+for(neighb in 1:nrow(top_5_neighborhood)){
+  print(paste0("For neighbourhood: ",top_5_neighborhood$neighbourhood_cleansed[neighb]))
+  toprint <- neighbourhood_tokens_transport %>% ungroup() %>% 
+    filter(neighbourhood_cleansed == top_5_neighborhood$neighbourhood_cleansed[neighb]) %>% 
+    top_n(10,total) %>%   
+    dplyr::select(-total) %>% 
+    mutate(rank = row_number())
+  
+  print(toprint)
+}
+```
+
+## Question c
+
+structured variables: description, neighborhood overview, diversity: under one hosting id the diversity of description and neighborhood overview
+
+```{r Qc}
+# The processed textual data of airbnb can now be use for getting insights to answer the question: what variable can be extracted from the text # that can be related with the rating score?
+# 1. Is readibility of property description an important predictor of the rating?
+# 2. Is mentioning the host name is important?
+
+# Get rating score for each listing.
+rating_categories <- all_data_df %>% 
+  ungroup() %>% 
+  group_by(listing_id) %>% 
+  summarise(rating = review_scores_rating) %>% 
+  slice(1) %>% 
+  na.omit() %>% 
+  ungroup()
+
+# Check rating distribution.
+ hist(rating_categories$rating,breaks = 50)
+# Severely left skewed.
+ 
+# Check the quantile information to find the levels that we want to aggregate the words in.
+quan <- quantile(rating_categories$rating, na.rm = T)
+
+# 75% of them rated above 97 score. let's use 75% as cut off and assign level in a rating group
+rating_categories$rating_category <- ifelse(rating_categories$rating< quan[4],1,2) 
+
+# Check what is the mostly used words in reviews for rating 1 and rating 2.
+ratings_categories_tokens_reviews <- comment_tokens_tf_idf %>%
+  left_join(rating_categories) %>%
+  group_by(rating_category,word) %>%
+  summarise(total = sum(tf_idf))
+
+print("When referring to comments: ")
+ratings_categories_tokens_reviews %>%
+  filter(rating_category==1) %>%
+  arrange(desc(total)) %>%
+  top_n(10)
+
+ratings_categories_tokens_reviews %>%
+  filter(rating_category==2) %>%
+  arrange(desc(total)) %>%
+  top_n(10)
+
+# Extract words in description
+ratings_categories_tokens_description <- description_tokens_tf_idf %>%
+  left_join(rating_categories) %>%
+  group_by(rating_category,word) %>%
+  summarise(total = sum(tf_idf))
+
+print("When referring to description: ")
+
+ratings_categories_tokens_description %>%
+  filter(rating_category==1) %>% arrange(desc(total)) %>%
+  top_n(10)
+
+ratings_categories_tokens_description %>%
+  filter(rating_category==2) %>%
+  arrange(desc(total)) %>%
+  top_n(10)
+
+
+ # Extract words in transit
+ratings_categories_tokens_transport <- transport_tokens_tf_idf %>%
+  left_join(rating_categories) %>%
+  group_by(rating_category,word) %>%
+  summarise(total =sum(tf_idf))
+
+print("When referring to access to transit: ")
+ratings_categories_tokens_transport %>%
+  filter(rating_category==1) %>%
+  arrange(desc(total)) %>%
+  top_n(10)
+
+ratings_categories_tokens_transport %>%
+  filter(rating_category==2) %>%
+  arrange(desc(total)) %>%
+  top_n(10)
+
+
+# Wordcloud
+#  1. word count/ binary mentioned eg: name of the neighborhood mentioned? something else mentioned? 
+# 2. the dominant words found in tf-idf
+# 3. extract the readibility/ diversity/ formality of the document
+# 1. Is readibility of property description an important predictor of the rating?
+# use readibility packages to score each description
+library(qdap)
+library(quanteda)
+library(koRpus)
+library(tm)
+
+all_listings <- all_data_df %>% 
+  ungroup() %>% 
+  dplyr::select(listing_id,description,price)%>%
+  unique(.) 
+
+# Remove non-English words
+all_listings <- all_listings %>% 
+ mutate(review_language = cld2::detect_language(description,plain_text = TRUE)) %>%
+  filter(review_language == "en")
+
+readability_all <- data.frame()
+readability_formality_diversity_table <- data.frame()
+
+for(i in 1:nrow(all_listings)){
+  readability_i <- data.frame() 
+  this_text <- iconv(all_listings$description[i])
+  this_text <- removeNumbers(this_text)  
+  # tm package
+  this_text <- removePunctuation(this_text)
+  tryCatch(readability_i <- flesch_kincaid(this_text),error=function(e){
+    cat("Error parsing")})  
+  if(!is.null(readability_i$Readability)){
+    readability_i <- readability_i$Readability
+    readability_i$listing_id <- all_listings$listing_id[i]
+    readability_all <- bind_rows(readability_all,readability_i) 
+  }
+}
+
+readability_all$listing_id <- as.character(readability_all$listing_id)
+readability_des <- readability_all %>%
+  dplyr::select(listing_id,word.count,syllable.count,FK_grd.lvl,FK_read.ease) %>%
+  left_join(all_listings)%>%
+  left_join(rating_categories)
+
+readability_des %>% 
+  group_by(rating_category) %>%
+  na.omit() %>% 
+  summarise(avg_word.count = mean(word.count),
+            avg_syllable.count = mean(syllable.count),
+            avg_FK_grd.lvl = mean(FK_grd.lvl),
+            avg_FK_read.ease = mean(FK_read.ease))
+
+
+
+# Formality Check
+formality_des<- formality(all_data_df$description,all_data_df$listing_id)
+
+formality_des$formality %>%
+  dplyr::select(listing_id,formality) -> formality_calc
+
+formality_calc$listing_id <- as.character(formality_calc$listing_id)
+
+readability_formality_diversity_table<- formality_calc %>%
+  left_join(readability_des) %>%
+  na.omit()  
+
+readability_formality_diversity_table %>%
+  dplyr::select(formality) %>%
+  unlist() %>%
+  as.numeric() %>%
+  hist() 
+
+readability_formality_diversity_table %>%
+  dplyr::select(FK_grd.lvl,rating_category) %>%
+  ggplot(aes (y = FK_grd.lvl, fill = rating_category)) + geom_histogram(show.legend = FALSE) +  facet_wrap(~ rating_category, scales = "free_y") +  coord_flip() +  ggtitle("Formality check")
+
+readability_formality_diversity_table %>%
+  dplyr::select(formality,rating_category) %>%
+  ggplot(aes (y = formality, fill = rating_category)) + geom_histogram(show.legend = FALSE) +  facet_wrap(~ rating_category, scales = "free_y") +  coord_flip() +  ggtitle("Formality check") 
+
+t.test(readability_formality_diversity_table$formality~factor(readability_formality_diversity_table$rating_category))
+
+t.test(readability_formality_diversity_table$FK_grd.lvl~factor(readability_formality_diversity_table$rating_category))
+
+# Diversity Check. First, let's calculate the diversity score of each listing description.
+
+host_info <- all_data_df %>% ungroup() %>% 
+  dplyr::select(listing_id, host_id) %>% unique(.)
+
+all_listings <- all_listings %>% 
+  left_join(host_info)  
+  
+all_listings$listing_id <- as.character(all_listings$listing_id) 
+rating_categories$listing_id <- as.character(rating_categories$listing_id) 
+readability_formality_diversity_table$listing_id <- as.character(readability_formality_diversity_table$listing_id) 
+  
+readability_formality_diversity_table <- all_listings %>% 
+  left_join(qdap::diversity(all_listings$description, all_listings$listing_id)) %>% 
+  left_join(rating_categories) %>%
+  left_join(readability_formality_diversity_table) %>% 
+  na.omit()
+
+t.test(readability_formality_diversity_table$shannon~factor (readability_formality_diversity_table$rating_category))
+
+# diversity is significantly contributing to rating categories.
+
+# let's check under one host_id, how many listings they own?
+all_listings %>%  
+  group_by(host_id) %>% 
+  summarise(total = n()) %>%
+  arrange(desc(total)) 
+  
+# Then, let's check under one host who owns more than one listing properties, whether the more diverse in descriptions which are related with marketing effort, has anything to do with rating scores.
+# all_listings %>% 
+#   group_by(host_id) %>% 
+# 
+# qdap::diversity(all_listings$description, all_listings$host_id)
+
+```
+
+### Qc-a
+
+```{r c-a}
+# 2. Is mentioning the host name is important?
+
+#Create a new variable called host_name_mentioned, which = 0 if host_name is NA, and = 1 otherwise.
+all_data_df$host_name_mentioned <- NA
+
+# Use grepl to find whether comments include host name
+for(i in 1:nrow(all_data_df)){
+  tryCatch(check_h <- as.numeric(grepl(all_data_df$host_name[i],
+                                       all_data_df$comments[i],
+                                       ignore.case = T)),error=function(e){
+                                          cat("ignore this one")})
+  all_data_df$host_name_mentioned[i] <- check_h
+}
+
+ggplot(subset(all_data_df,!is.na(host_name_mentioned)), aes(x=factor(host_name_mentioned),y=review_scores_rating))+geom_boxplot()
+
+# Run a T-test to compare the average scores of the two groups
+t.test(all_data_df$review_scores_rating~factor(all_data_df$host_name_mentioned))
+
+
+```
+
+#### Interpretation
+
+The mean scores rating for reviews of listings with hosts' names mentioned is 96.54416. The mean scores rating for those without hosts' names mentioned is 95.28563. The mean scores rating is significantly larger for listings with hosts' names mentioned, Welch t(334329)=-109.91, p\<.0001, with a difference of 1.25853.
