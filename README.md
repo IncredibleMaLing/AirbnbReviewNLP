@@ -1,2 +1,2 @@
 # AirbnbReviewNLP
-NLP pipeline to conduct analysis on Airbnb Review
+Data crawling -> Data cleaning -> Tokenisation -> TF-IDF -> Keyword analysis -> Sentiment Analysis -> Linear regression modelling
